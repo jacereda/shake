@@ -84,6 +84,7 @@ library
     hs-source-dirs:   src
     build-depends:
         base == 4.*,
+        containers,
         old-time,
         directory,
         hashable >= 1.1.2.3,
@@ -172,6 +173,7 @@ executable shake
     ghc-options: -threaded -rtsopts "-with-rtsopts=-I0 -qg -qb"
     build-depends:
         base == 4.*,
+        containers,                  
         old-time,
         directory,
         hashable >= 1.1.2.3,
@@ -263,6 +265,7 @@ test-suite shake-test
     ghc-options: -threaded -rtsopts
     build-depends:
         base == 4.*,
+        containers,
         old-time,
         directory,
         hashable >= 1.1.2.3,

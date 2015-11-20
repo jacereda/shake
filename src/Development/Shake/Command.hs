@@ -164,7 +164,7 @@ commandExplicit funcName icopts results exe args = do
     skipper $ tracker $ \exe args -> verboser $ tracer $ commandExplicitIO funcName copts results exe args
 
 
-data FSAT = FSATWrite FilePath | FSATRead FilePath | FSATMove FilePath FilePath | FSATDelete FilePath
+data FSAT = FSATWrite !FilePath | FSATRead !FilePath | FSATMove !FilePath FilePath | FSATDelete !FilePath
 
 parseFSAT :: String -> String -> [FSAT] -- any parse errors are skipped
 parseFSAT ops = mapMaybe (f . wordsBy (== '|')) . filter ((`elem` ops) . head) . lines

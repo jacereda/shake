@@ -7,13 +7,12 @@ module Development.Shake.Pool(
     ) where
 
 import Control.Concurrent.Extra
-import Development.Shake.Errors
 import System.Time.Extra
 import Control.Exception
 import Control.Monad
 import General.Timing
 import qualified Data.HashSet as Set
-import qualified Data.HashMap.Strict as Map
+import qualified Data.Sequence as S
 import System.Random
 
 
@@ -23,50 +22,24 @@ import System.Random
 -- Monad for non-deterministic (but otherwise pure) computations
 type NonDet a = IO a
 
--- Left = deterministic list, Right = non-deterministic tree
-data Queue a = Queue [a] (Either [a] (Maybe (Tree a)))
+data Queue a = Queue [a] (S.Seq a) Bool
 
 newQueue :: Bool -> Queue a
-newQueue deterministic = Queue [] $ if deterministic then Left [] else Right Nothing
+newQueue = Queue [] S.empty
 
 enqueuePriority :: a -> Queue a -> Queue a
-enqueuePriority x (Queue p t) = Queue (x:p) t
+enqueuePriority x (Queue p t det) = Queue (x:p) t det
 
-enqueue :: a -> Queue a -> Queue a
-enqueue x (Queue p (Left xs)) = Queue p $ Left $ x:xs
-enqueue x (Queue p (Right Nothing)) = Queue p $ Right $ Just $ singleTree x
-enqueue x (Queue p (Right (Just t))) = Queue p $ Right $ Just $ insertTree x t
+enqueue :: a -> Queue a -> NonDet (Queue a)
+enqueue x (Queue p xs True) = return $ Queue p (xs S.|> x) True
+enqueue x (Queue p xs False) = do
+  r <- randomIO
+  return $ Queue p (if r then xs S.|> x else x S.<| xs) False
 
-dequeue :: Queue a -> Maybe (NonDet (a, Queue a))
-dequeue (Queue (p:ps) t) = Just $ return (p, Queue ps t)
-dequeue (Queue [] (Left (x:xs))) = Just $ return (x, Queue [] $ Left xs)
-dequeue (Queue [] (Left [])) = Nothing
-dequeue (Queue [] (Right (Just t))) = Just $ do bs <- randomIO; (x,t) <- return $ removeTree bs t; return (x, Queue [] $ Right t)
-dequeue (Queue [] (Right Nothing)) = Nothing
-
-
----------------------------------------------------------------------
--- TREE
-
--- A tree where removal is random. Nodes are stored at indicies 0..n-1
-newtype Tree a = Tree (Map.HashMap Int a)
-
-singleTree :: a -> Tree a
-singleTree x = Tree $ Map.singleton 0 x
-
-insertTree :: a -> Tree a -> Tree a
-insertTree x (Tree mp) = Tree $ Map.insert (Map.size mp) x mp
-
--- Remove an item at random, put the n-1 item to go in it's place
-removeTree :: Int -> Tree a -> (a, Maybe (Tree a))
-removeTree rnd (Tree mp)
-        | n == 0 = err "removeTree, tree is empty"
-        | n == 1 = (mp Map.! 0, Nothing)
-        | i == n-1 = (mp Map.! i, Just $ Tree $ Map.delete i mp)
-        | otherwise = (mp Map.! i, Just $ Tree $ Map.insert i (mp Map.! (n-1)) $ Map.delete (n-1) mp)
-    where
-        n = Map.size mp
-        i = abs rnd `mod` n
+dequeue :: Queue a -> Maybe (a, Queue a)
+dequeue (Queue (p:ps) t det) = Just (p, Queue ps t det)
+dequeue (Queue [] xs det) | S.null xs = Nothing
+                        | otherwise = Just (xs `S.index` 0, Queue [] (S.drop 1 xs) det)
 
 
 ---------------------------------------------------------------------
@@ -101,8 +74,7 @@ step pool@(Pool var done) op = do
     let onVar act = modifyVar_ var $ maybe (return Nothing) act
     onVar $ \s -> do
         s <- op s
-        res <- maybe (return Nothing) (fmap Just) $ dequeue $ todo s
-        case res of
+        case (dequeue $ todo s) of
             Just (now, todo2) | Set.size (threads s) < threadsLimit s -> do
                 -- spawn a new worker
                 t <- forkFinally now $ \res -> case res of
@@ -126,15 +98,13 @@ step pool@(Pool var done) op = do
 -- | Add a new task to the pool, may be cancelled by sending it an exception
 addPool :: Pool -> IO a -> IO ()
 addPool pool act = step pool $ \s -> do
-    todo <- return $ enqueue (void act) (todo s)
+    todo <- enqueue (void act) (todo s)
     return s{todo = todo}
 
 -- | Add a new task to the pool, may be cancelled by sending it an exception.
 --   Takes priority over everything else.
 addPoolPriority :: Pool -> IO a -> IO ()
-addPoolPriority pool act = step pool $ \s -> do
-    todo <- return $ enqueuePriority (void act) (todo s)
-    return s{todo = todo}
+addPoolPriority pool act = step pool $ \s -> return s{todo = enqueuePriority (void act) (todo s)}
 
 
 -- | Temporarily increase the pool by 1 thread. Call the cleanup action to restore the value.
