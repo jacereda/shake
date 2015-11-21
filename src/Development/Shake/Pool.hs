@@ -14,33 +14,27 @@ import General.Timing
 import qualified Data.HashSet as Set
 import qualified Data.Sequence as S
 import System.Random
-
+import Data.Bits(rotateL)
 
 ---------------------------------------------------------------------
 -- UNFAIR/RANDOM QUEUE
 
--- Monad for non-deterministic (but otherwise pure) computations
-type NonDet a = IO a
 
-data Queue a = Queue [a] (S.Seq a) Bool
+data Queue a = Queue ![a] !(S.Seq a) !Int
 
-newQueue :: Bool -> Queue a
+newQueue :: Int -> Queue a
 newQueue = Queue [] S.empty
 
 enqueuePriority :: a -> Queue a -> Queue a
-enqueuePriority x (Queue p t det) = Queue (x:p) t det
+enqueuePriority x (Queue p t shuffle) = Queue (x:p) t shuffle
 
-enqueue :: a -> Queue a -> NonDet (Queue a)
-enqueue x (Queue p xs True) = return $ Queue p (xs S.|> x) True
-enqueue x (Queue p xs False) = do
-  r <- randomIO
-  return $ Queue p (if r then xs S.|> x else x S.<| xs) False
+enqueue :: a -> Queue a -> Queue a
+enqueue x (Queue p xs shuffle) = Queue p (if odd shuffle then xs S.|> x else x S.<| xs) (rotateL shuffle 1)
 
 dequeue :: Queue a -> Maybe (a, Queue a)
-dequeue (Queue (p:ps) t det) = Just (p, Queue ps t det)
-dequeue (Queue [] xs det) | S.null xs = Nothing
-                        | otherwise = Just (xs `S.index` 0, Queue [] (S.drop 1 xs) det)
-
+dequeue (Queue (p:ps) t shuffle) = Just (p, Queue ps t shuffle)
+dequeue (Queue [] xs shuffle) | S.null xs = Nothing
+                              | otherwise = Just (xs `S.index` 0, Queue [] (S.drop 1 xs) shuffle)
 
 ---------------------------------------------------------------------
 -- THREAD POOL
@@ -63,17 +57,17 @@ data S = S
     }
 
 
-emptyS :: Int -> Bool -> S
-emptyS n deterministic = S Set.empty n 0 0 $ newQueue deterministic
+emptyS :: Int -> Int -> S
+emptyS n shuffle = S Set.empty n 0 0 $ newQueue shuffle
 
 
 -- | Given a pool, and a function that breaks the S invariants, restore them
 --   They are only allowed to touch threadsLimit or todo
-step :: Pool -> (S -> NonDet S) -> IO ()
+step :: Pool -> (S -> S) -> IO ()
 step pool@(Pool var done) op = do
     let onVar act = modifyVar_ var $ maybe (return Nothing) act
-    onVar $ \s -> do
-        s <- op s
+    onVar $ \s' -> do
+        let s = op s'
         case (dequeue $ todo s) of
             Just (now, todo2) | Set.size (threads s) < threadsLimit s -> do
                 -- spawn a new worker
@@ -85,7 +79,7 @@ step pool@(Pool var done) op = do
                         return Nothing
                     Right _ -> do
                         t <- myThreadId
-                        step pool $ \s -> return s{threads = Set.delete t $ threads s}
+                        step pool $ \s -> s{threads = Set.delete t $ threads s}
                 let threads2 = Set.insert t $ threads s
                 return $ Just s{todo = todo2, threads = threads2
                                ,threadsSum = threadsSum s + 1, threadsMax = threadsMax s `max` Set.size threads2}
@@ -97,29 +91,27 @@ step pool@(Pool var done) op = do
 
 -- | Add a new task to the pool, may be cancelled by sending it an exception
 addPool :: Pool -> IO a -> IO ()
-addPool pool act = step pool $ \s -> do
-    todo <- enqueue (void act) (todo s)
-    return s{todo = todo}
+addPool pool act = step pool $ \s -> s{todo = enqueue (void act) (todo s)}
 
 -- | Add a new task to the pool, may be cancelled by sending it an exception.
 --   Takes priority over everything else.
 addPoolPriority :: Pool -> IO a -> IO ()
-addPoolPriority pool act = step pool $ \s -> return s{todo = enqueuePriority (void act) (todo s)}
-
+addPoolPriority pool act = step pool $ \s -> s{todo = enqueuePriority (void act) (todo s)}
 
 -- | Temporarily increase the pool by 1 thread. Call the cleanup action to restore the value.
 --   After calling cleanup you should requeue onto a new thread.
 increasePool :: Pool -> IO (IO ())
 increasePool pool = do
-    step pool $ \s -> return s{threadsLimit = threadsLimit s + 1}
-    return $ step pool $ \s -> return s{threadsLimit = threadsLimit s - 1}
+    step pool $ \s -> s{threadsLimit = threadsLimit s + 1}
+    return $ step pool $ \s -> s{threadsLimit = threadsLimit s - 1}
 
 
 -- | Run all the tasks in the pool on the given number of works.
 --   If any thread throws an exception, the exception will be reraised.
 runPool :: Bool -> Int -> (Pool -> IO ()) -> IO () -- run all tasks in the pool
 runPool deterministic n act = do
-    s <- newVar $ Just $ emptyS n deterministic
+    shuffle <- randomIO
+    s <- newVar $ Just $ emptyS n (if deterministic then 0 else shuffle)
     done <- newBarrier
 
     let cleanup = modifyVar_ s $ \s -> do

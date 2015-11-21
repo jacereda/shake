@@ -1,4 +1,4 @@
-{-# LANGUAGE FlexibleInstances, TypeSynonymInstances, TypeOperators, ScopedTypeVariables #-}
+{-# LANGUAGE FlexibleInstances, TypeSynonymInstances, TypeOperators, ScopedTypeVariables, NamedFieldPuns #-}
 
 -- | This module provides functions for calling command line programs, primarily
 --   'command' and 'cmd'. As a simple example:
@@ -26,7 +26,7 @@ import Data.Maybe
 import System.Directory
 import System.Environment.Extra
 import System.Exit
-import System.IO.Extra
+import System.IO.Extra hiding (withTempFile)
 import System.Process
 import System.Info.Extra
 import System.Time.Extra
@@ -103,41 +103,51 @@ instance Eq Pid where _ == _ = True
 ---------------------------------------------------------------------
 -- ACTION EXPLICIT OPERATION
 
+-- | Given explicit operations, apply the advance ones, like skip/trace/track/autodep
 commandExplicit :: String -> [CmdOption] -> [Result] -> String -> [String] -> Action [Result]
-commandExplicit funcName icopts results exe args = do
-    opts <- getShakeOptions
-    verb <- getVerbosity
+commandExplicit funcName opts results exe args = do
+    ShakeOptions
+        {shakeCommandOptions,shakeRunCommands
+        ,shakeLint,shakeLintInside,shakeLintIgnore} <- getShakeOptions
+    opts <- return $ shakeCommandOptions ++ opts
 
-    let copts = icopts ++ shakeCommandOptions opts
-
-    let skipper act = if null results && not (shakeRunCommands opts) then return [] else act
+    let skipper act = if null results && not shakeRunCommands then return [] else act
 
     let verboser act = do
-            let cwd = listToMaybe $ reverse [x | Cwd x <- copts]
+            let cwd = listToMaybe $ reverse [x | Cwd x <- opts]
             putLoud $ maybe "" (\x -> "cd " ++ x ++ "; ") cwd ++ saneCommandForUser exe args
+            verb <- getVerbosity
             (if verb >= Loud then quietly else id) act
 
-    let tracer = case reverse [x | Traced x <- copts] of
+    let tracer = case reverse [x | Traced x <- opts] of
             "":_ -> liftIO
             msg:_ -> traced msg
             [] -> traced (takeFileName exe)
 
-    let tracker act = case shakeLint opts of
+    let useLint = shakeLint == Just LintFSATrace
+    let useAutoDeps = AutoDeps `elem` opts
+    let useShell = Shell `elem` opts
+    opts <- return $ if useLint || useAutoDeps then filter (/= Shell) opts else opts
+
+    let tracker act = case shakeLint of
             Just LintFSATrace -> fsatrace act
             _ -> if autodepping then autodeps act else act exe args
-        autodepping = AutoDeps `elem` copts
-        inside = shakeLintInside opts
-        ignore = map (?==) $ shakeLintIgnore opts
+        autodepping = AutoDeps `elem` opts
+        ignore = map (?==) shakeLintIgnore
         ham cwd xs = [makeRelative cwd x | x <- map toStandard xs
-                                         , any (`isPrefixOf` x) inside
+                                         , any (`isPrefixOf` x) shakeLintInside
                                          , not $ any ($ x) ignore]
-        withTemp f cont = do
-            (x, cleanup) <- liftIO f
-            actionFinally (cont x) cleanup
 
-        fsatrace act = withTemp newTempFile $ \file -> do
-            res <- act "fsatrace" $ file:"--":exe:args
-            xs <- liftIO $ parseFSAT "rwm" <$> readFileUTF8' file
+        fsaCmd act file
+            | not useShell = act "fsatrace" $ file:"--":exe:args
+            | not isWindows = act "fsatrace" [file,"--","/bin/sh","-c",unwords $ exe:args]
+            | otherwise = act "fsatrace" [file,"--","cmd",unwords $ "/c":exe:args]
+                -- on Win98 it's command instead of cmd, but no one uses Win98 anymore
+                -- the fact that the arguments are [cmd,/c whatever] is importantant, making it 1 or 3 fails
+
+        fsatrace act = withTempFile $ \file -> do
+            res <- fsaCmd act file
+            xs <- liftIO $ parseFSAT <$> readFileUTF8' file
             cwd <- liftIO getCurrentDirectory
             let reader (FSATRead x) = Just x; reader _ = Nothing
                 writer (FSATWrite x) = Just x; writer (FSATMove x _) = Just x; writer _ = Nothing
@@ -152,31 +162,36 @@ commandExplicit funcName icopts results exe args = do
             trackWrite writes
             return res
 
-        autodeps act = withTemp newTempFile $ \file -> do
-            res <-  act "fsatrace" $ file:"--":exe:args
-            xs <- liftIO $ parseFSAT "r" <$> readFileUTF8' file
+        autodeps act = withTempFile $ \file -> do
+            res <-  fsaCmd act file
+            xs <- liftIO $ parseFSAT <$> readFileUTF8' file
             cwd <- liftIO getCurrentDirectory
-            let reader (FSATRead x) = x
-                reader _ = error "autodeps"
-            needNorm $ ham cwd $ map reader xs
+            needNorm $ ham cwd [x | FSATRead x <- xs]
             return res
 
-    skipper $ tracker $ \exe args -> verboser $ tracer $ commandExplicitIO funcName copts results exe args
+    skipper $ tracker $ \exe args -> verboser $ tracer $ commandExplicitIO funcName opts results exe args
 
 
-data FSAT = FSATWrite !FilePath | FSATRead !FilePath | FSATMove !FilePath FilePath | FSATDelete !FilePath
+-- | Parse the FSATrace structure
+data FSAT
+    = FSATWrite FilePath
+    | FSATRead FilePath
+    | FSATDelete FilePath
+    | FSATMove FilePath FilePath
 
-parseFSAT :: String -> String -> [FSAT] -- any parse errors are skipped
-parseFSAT ops = mapMaybe (f . wordsBy (== '|')) . filter ((`elem` ops) . head) . lines
-    where f ["w",x] = Just $ FSATWrite x
-          f ["r",x] = Just $ FSATRead x
-          f ["m",x,y] = Just $ FSATMove x y
-          f ["d",x] = Just $ FSATDelete x
+-- | Parse the 'FSAT' entries, ignoring anything you don't understand.
+parseFSAT :: String -> [FSAT]
+parseFSAT = mapMaybe f . lines
+    where f ('w':'|':xs) = Just $ FSATWrite xs
+          f ('r':'|':xs) = Just $ FSATRead xs
+          f ('d':'|':xs) = Just $ FSATDelete xs
+          f ('m':'|':xs) | (xs,'|':ys) <- break (== '|') xs = Just $ FSATMove xs ys
           f _ = Nothing
 
 ---------------------------------------------------------------------
 -- IO EXPLICIT OPERATION
 
+-- | Given a very explicit set of CmdOption, translate them to a General.Process structure
 commandExplicitIO :: String -> [CmdOption] -> [Result] -> String -> [String] -> IO [Result]
 commandExplicitIO funcName opts results exe args = do
     let (grabStdout, grabStderr) = both or $ unzip $ for results $ \r -> case r of
@@ -254,6 +269,7 @@ commandExplicitIO funcName opts results exe args = do
         Right (dur,(pid,ex)) -> mapM (\f -> f dur pid ex) resultBuild
 
 
+-- | Apply all environment operations, to produce a new environment to use.
 resolveEnv :: [CmdOption] -> IO (Maybe [(String, String)])
 resolveEnv opts
     | null env, null addEnv, null addPath, null remEnv = return Nothing
@@ -302,11 +318,14 @@ resolvePath po
 resolvePath po = return po
 
 
+-- | Given a list of directories, and a file name, return the complete path if you can find it.
+--   Like findExecutable, but with a custom PATH.
 findExecutableWith :: [FilePath] -> String -> IO (Maybe FilePath)
 findExecutableWith path x = flip firstJustM (map (</> x) path) $ \s ->
     ifM (doesFileExist s) (return $ Just s) (return Nothing)
 
 
+-- Given a command line, show it in a way suitable for the user.
 -- Like System.Process, but tweaked to show less escaping,
 -- Relies on relatively detailed internals of showCommandForUser.
 saneCommandForUser :: FilePath -> [String] -> String
@@ -534,3 +553,13 @@ instance Arg [String] where arg = map Right
 instance Arg CmdOption where arg = return . Left
 instance Arg [CmdOption] where arg = map Left
 instance Arg a => Arg (Maybe a) where arg = maybe [] arg
+
+
+---------------------------------------------------------------------
+-- UTILITIES
+
+-- Copied from Derived. Once Derived no longer exports cmd stuff, import from there.
+withTempFile :: (FilePath -> Action a) -> Action a
+withTempFile act = do
+    (file, del) <- liftIO newTempFile
+    act file `actionFinally` del

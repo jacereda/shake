@@ -9,6 +9,7 @@ import Control.Exception.Extra
 import System.Time.Extra
 import Control.Monad.Extra
 import System.Directory
+import System.Environment
 import Test.Type
 import System.Exit
 import System.Process
@@ -93,6 +94,13 @@ main = shaken test $ \args obj -> do
         Stdout out <- cmd (AddEnv "FOO" "GOODBYE SHAKE") Shell helper "vFOO"
         liftIO $ out === "GOODBYE SHAKE\n"
 
+    "space" !> do
+        Stdout out <- cmd helper ["oSPACE 1"]
+        liftIO $ out === "SPACE 1\n"
+        unless isWindows $ do
+            Stdout out <- cmd helper Shell "\"oSPACE 2\""
+            liftIO $ out === "SPACE 2\n"
+
     "path" !> do
         let path = AddPath [dropTrailingPathSeparator $ obj ""] []
         unit $ cmd $ obj "shake_helper"
@@ -140,8 +148,11 @@ main = shaken test $ \args obj -> do
         liftIO $ assertContents file "hello\n"
 
 
-test build obj =
+test build obj = do
     -- reduce the overhead by running all the tests in parallel
+    -- lint can make a big different to the command lines, so test with and without
+    whenM hasTracker $
+        build ["-j4","--no-lint"]
     build ["-j4"]
 
 
