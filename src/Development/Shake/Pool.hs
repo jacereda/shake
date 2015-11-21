@@ -12,29 +12,34 @@ import Control.Exception
 import Control.Monad
 import General.Timing
 import qualified Data.HashSet as Set
-import qualified Data.Sequence as S
 import System.Random
-import Data.Bits(rotateL)
+import Data.Bits(rotateL, (.&.))
 
 ---------------------------------------------------------------------
 -- UNFAIR/RANDOM QUEUE
 
-
-data Queue a = Queue ![a] !(S.Seq a) !Int
+-- The task queue consists of 3 lists (priority, front, back) and a shuffle pattern
+data Queue a = Queue ![a] ![a] ![a] !Int
 
 newQueue :: Int -> Queue a
-newQueue = Queue [] S.empty
+newQueue = Queue [] [] []
 
 enqueuePriority :: a -> Queue a -> Queue a
-enqueuePriority x (Queue p t shuffle) = Queue (x:p) t shuffle
+enqueuePriority x (Queue p f b shuffle) = Queue (x:p) f b shuffle
 
 enqueue :: a -> Queue a -> Queue a
-enqueue x (Queue p xs shuffle) = Queue p (if odd shuffle then xs S.|> x else x S.<| xs) (rotateL shuffle 1)
+enqueue x (Queue p f b shuffle) = Queue p (x:f') b' shuffle'
+  where f' = if invert then b else f
+        b' = if invert then f else b
+        invert = odd shuffle
+        shuffle' = (rotateL shuffle 1)
 
 dequeue :: Queue a -> Maybe (a, Queue a)
-dequeue (Queue (p:ps) t shuffle) = Just (p, Queue ps t shuffle)
-dequeue (Queue [] xs shuffle) | S.null xs = Nothing
-                              | otherwise = Just (xs `S.index` 0, Queue [] (S.drop 1 xs) shuffle)
+dequeue (Queue (p:ps) f b shuffle) = Just (p, Queue ps f b shuffle)
+dequeue (Queue [] (f:fs) b shuffle) = Just (f, Queue [] fs b shuffle)
+dequeue (Queue [] [] (b:bs) shuffle) = Just (b, Queue [] bs [] shuffle)
+dequeue (Queue [] [] [] _) = Nothing
+
 
 ---------------------------------------------------------------------
 -- THREAD POOL
